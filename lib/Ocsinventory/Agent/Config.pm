@@ -4,6 +4,7 @@ use strict;
 use Getopt::Long;
 
 our $VERSION = '2.10.4';
+our $ITAM_VERSION = '2.0.0';
 
 my $basedir = '';
 my $default = {
@@ -44,6 +45,7 @@ my $default = {
     # Other values that can't be changed with the
     # CLI parameters
     'version'   => $VERSION,
+    'itam_version' => $ITAM_VERSION,
     'deviceid'  => '',
     'basevardir'=>  $basedir.'/var/lib/ocsinventory-agent',
     'logdir'    =>  $basedir.'/var/log/ocsinventory-agent',
