@@ -108,6 +108,7 @@ sub _write_update_info_xml {
     if (open(my $fh, '>', $info_path)) {
         print $fh $xml;
         close $fh;
+        chmod 0600, $info_path;
         $logger->info("Wrote update config to $info_path");
         return 1;
     } else {
