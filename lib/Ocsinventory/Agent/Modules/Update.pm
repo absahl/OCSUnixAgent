@@ -13,6 +13,7 @@ use warnings;
 use version;
 use Fcntl qw/:flock/;
 use File::Path qw(make_path);
+use File::Copy;
 use XML::Simple;
 use Digest::MD5;
 
@@ -249,11 +250,11 @@ sub update_end_handler {
     }
 
     # Execute core task
-    $logger->debug("initiating core update task");
+    $logger->debug("Initiating core update task");
     $self->_update_core_task($expected_checksum);
 
     # Clean exit through finish
-    $logger->debug("initiating cleanup");
+    $logger->debug("Initiating cleanup");
     finish($logger, $context);
 }
 
@@ -262,7 +263,6 @@ sub _update_core_task {
     my ($self, $expected_checksum) = @_;
     my $logger  = $self->{logger};
     my $context = $self->{context};
-    my $network = $context->{network};
 
     my $info_file = $context->{installpath} . '/update/info';
 
@@ -308,42 +308,143 @@ sub _update_core_task {
             $info->{VERSION}
         ));
 
-        # Download the update
-        unless (defined $info->{URL_SUFFIX} && $info->{URL_SUFFIX} ne '') {
-            $logger->error("No URL_SUFFIX provided in info file, cannot proceed with update");
+        # Backup configuration data and logs
+        $logger->debug("Backing up configuration data and logs");
+        my $backup_ok = $self->_backup_data();
+        unless ($backup_ok) {
+            $logger->error("Backup failed, aborting update process");
             return 0;
         }
-        
-        my $max_tries = 5;  # Default max tries for download
-        my $full_url = "https://item-agents.s3.us-east-1.amazonaws.com/" . $info->{URL_SUFFIX};
-        
-        # Choose installer extension based on OS
-        my $installer_ext = $^O eq 'darwin' ? '.pkg' : '.deb';
-        my $installer_path = $context->{installpath} . '/update/installer' . $installer_ext;
-        $logger->debug("Downloading update from: $full_url");
-        my $err_msg;
-        for (my $try = 1; $try <= $max_tries; $try++)
-        {
-            $err_msg = $network->getFileFromUrl($full_url, $installer_path);
-            last unless defined($err_msg); # break early if not failed
-        }
+        $logger->debug("Backup successful");
 
-        # In case of failure
-        if (defined($err_msg)) {
-            $logger->error("Failed to download installer in maximum tries <error:$err_msg> <tries:$max_tries>");
-            # report error and clean package in case URL is expired
-            if ($err_msg eq 'Request has expired') {
-                $logger->info("Failed to download installer because URL has expired");
-            }
-            return 1;
+        # Download the installer
+        $logger->debug("Downloading installer");
+        my $download_ok = $self->_download_installer($info->{URL_SUFFIX});
+        unless ($download_ok) {
+            $logger->error("Installer download failed, aborting update process");
+            return 0;
         }
-
         $logger->debug("Installer downloaded successfully");
+
+        # What's next?
+        
         return 1;
     } else {
         $logger->error("Checksum mismatch for info file. Expected $expected_checksum but got $child_checksum");
         return 0;
     }
+}
+
+sub _backup_data {
+    my ($self) = @_;
+    my $logger = $self->{logger};
+    
+    my $config_dir = '/etc/ocsinventory-agent';
+    my $config_backup_dir = '/var/db/ocsinventory-agent/backup/configs';
+    my $log_file = '/var/log/ocsng.log';
+    my $logs_backup_dir = '/var/db/ocsinventory-agent/backup/logs';
+    
+    # Create backup directories if they don't exist
+    eval {
+        make_path($config_backup_dir, { mode => 0700 });
+        make_path($logs_backup_dir,   { mode => 0700 });
+    };
+    if ($@) {
+        $logger->error("Failed to create backup directories: $@");
+        return 0;
+    }
+    
+    # Copy configuration files (flat structure)
+    if (-d $config_dir) {
+        # Read directory contents
+        if (opendir(my $dh, $config_dir)) {
+            while (my $file = readdir($dh)) {
+                next if $file =~ /^\.\.?$/;  # Skip . and ..
+                next if -d "$config_dir/$file"; # Skip any subdirectories
+                
+                my $src_file = "$config_dir/$file";
+                my $dest_file = "$config_backup_dir/$file";
+                
+                unless (copy($src_file, $dest_file)) {
+                    $logger->error("Failed to copy $src_file to $dest_file: $!");
+                    closedir($dh);
+                    return 0;
+                }
+            }
+            closedir($dh);
+        } else {
+            $logger->error("Cannot open directory $config_dir: $!");
+            return 0;
+        }
+    } else {
+        $logger->error("Configuration directory $config_dir does not exist");
+        return 0;
+    }
+    
+    # Copy log file if it exists
+    if (-f $log_file) {
+        my $log_dest = "$logs_backup_dir/ocsng.log";
+        unless (copy($log_file, $log_dest)) {
+            $logger->error("Failed to copy log file $log_file to $log_dest: $!");
+            return 0;
+        }
+    } else {
+        $logger->info("Log file $log_file does not exist, skipping backup");
+    }
+    
+    $logger->info("Successfully backed up configuration files and logs");
+    return 1;
+}
+
+sub _download_installer {
+    my ($self, $url_suffix) = @_;
+    my $logger  = $self->{logger};
+    my $context = $self->{context};
+    my $network = $context->{network};
+
+    $logger->debug("Entering _download_installer with URL_SUFFIX: $url_suffix");
+
+    unless (defined $url_suffix && $url_suffix ne '') {
+        $logger->error("No URL_SUFFIX provided in info file, cannot proceed with download");
+        return 0;
+    }
+    
+    my $max_tries = 5;  # Default max tries for download
+    my $full_url = "https://item-agents.s3.us-east-1.amazonaws.com/" . $url_suffix;
+    
+    # Choose installer extension based on OS
+    my $installer_dir = '/var/db/ocsinventory-agent/update';
+    my $installer_path = "$installer_dir/$url_suffix";
+    
+    # Create directory if it doesn't exist
+    eval {
+        make_path($installer_dir, { mode => 0700 });
+    };
+    if ($@) {
+        $logger->error("Failed to create directory $installer_dir: $@");
+        return 0;
+    }
+    
+    $logger->debug("Downloading installer <url:$full_url>");
+    my $err_msg;
+    for (my $try = 1; $try <= $max_tries; $try++)
+    {
+        $err_msg = $network->getFileFromUrl($full_url, $installer_path);
+        last unless defined($err_msg); # break early if not failed
+    }
+
+    # In case of failure
+    if (defined($err_msg)) {
+        $logger->error("Failed to download installer in maximum tries <error:$err_msg> <tries:$max_tries>");
+        # report error and clean package in case URL is expired
+        if ($err_msg eq 'Request has expired') {
+            $logger->info("Failed to download installer because URL has expired");
+        }
+        return 0;
+    }
+
+    $logger->debug("Installer downloaded successfully");
+    return 1; # Indicate success
 }
 
 # Private finish subroutine for update module - mirrors the download finish
