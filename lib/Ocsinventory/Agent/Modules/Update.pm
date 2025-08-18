@@ -12,11 +12,97 @@ use warnings;
 
 use version;
 use Fcntl qw/:flock/;
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use File::Copy;
 use File::Basename qw(basename);
 use XML::Simple;
 use Digest::MD5;
+use POSIX qw(strftime);
+
+sub _format_timestamp_from_mtime {
+    my ($path) = @_;
+    my @st = stat($path);
+    my $mtime = $st[9] || time();
+    return strftime('%Y%m%d_%H%M%S', localtime($mtime));
+}
+
+sub _ensure_dir_0700 {
+    my ($dir, $logger) = @_;
+    eval { make_path($dir, { mode => 0700 }); };
+    if ($@) {
+        $logger->error("Failed to create directory $dir: $@");
+        return 0;
+    }
+    return 1;
+}
+
+sub _zip_with_ditto {
+    my ($source_dir, $dest_zip, $logger) = @_;
+    # On macOS, prefer ditto to preserve metadata
+    my $status = system('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', $source_dir, $dest_zip);
+    if ($status != 0) {
+        my $code = $status >> 8;
+        $logger->error("Archiving with ditto failed (exit $code) for $source_dir -> $dest_zip");
+        return 0;
+    }
+    return 1;
+}
+
+sub _prune_archives_keep_last_n {
+    my ($archives_dir, $keep_n, $logger) = @_;
+    opendir(my $dh, $archives_dir) or return;
+    my @files = grep { /\.zip$/ && -f "$archives_dir/$_" } readdir($dh);
+    closedir($dh);
+    return unless @files;
+    @files = map { [ $_, (stat("$archives_dir/$_"))[9] || 0 ] } @files;
+    @files = sort { $b->[1] <=> $a->[1] } @files; # newest first
+    my @to_delete = @files[$keep_n .. $#files] if @files > $keep_n;
+    for my $entry (@to_delete) {
+        my $file = "$archives_dir/".$entry->[0];
+        unlink $file or $logger->debug("Failed to remove old archive $file: $!");
+    }
+}
+
+sub _archive_and_reset_current {
+    my ($base_dir, $logger) = @_;
+    my $current_dir  = "$base_dir/current";
+    my $archives_dir = "$base_dir/archives";
+
+    # If current exists and has content, archive it
+    my $has_content = 0;
+    if (-d $current_dir && opendir(my $dhc, $current_dir)) {
+        while (my $e = readdir($dhc)) { next if $e =~ /^\.?\.?$/; $has_content = 1; last; }
+        closedir($dhc);
+    }
+
+    if ($has_content) {
+        return 0 unless _ensure_dir_0700($archives_dir, $logger);
+        my $ts = _format_timestamp_from_mtime($current_dir);
+        my $dest_zip = "$archives_dir/$ts.zip";
+        # Avoid filename collision by appending a counter
+        my $suffix = 0;
+        while (-e $dest_zip) { $suffix++; $dest_zip = "$archives_dir/${ts}_$suffix.zip"; }
+        my $ok = _zip_with_ditto($current_dir, $dest_zip, $logger);
+        if ($ok) {
+            $logger->info("Archived $current_dir to $dest_zip");
+            _prune_archives_keep_last_n($archives_dir, 5, $logger);
+        }
+    } else {
+        $logger->debug("No content in $current_dir to archive");
+    }
+
+    # Regardless of archive result, remove current to start fresh
+    if (-d $current_dir) {
+        remove_tree($current_dir, { error => \my $err });
+        if ($err && @{$err}) {
+            $logger->error("Failed to fully remove $current_dir");
+        } else {
+            $logger->debug("Removed $current_dir");
+        }
+    }
+
+    return 1;
+}
 
 sub new {
     my $name = "update";
@@ -354,11 +440,16 @@ sub _backup_data {
     }
     
     my $config_dir = '/etc/ocsinventory-agent';
-    my $config_backup_dir = '/var/db/ocsinventory-agent/backup/configs';
+    my $backup_base_dir = '/var/db/ocsinventory-agent/backup';
+    my $backup_current_dir = "$backup_base_dir/current";
+    my $config_backup_dir = "$backup_current_dir/configs";
     my $log_file = '/var/log/ocsng.log';
-    my $logs_backup_dir = '/var/db/ocsinventory-agent/backup/logs';
+    my $logs_backup_dir = "$backup_current_dir/logs";
     
     # Create backup directories if they don't exist
+    # Rotate existing backup/current into archives and start fresh
+    _archive_and_reset_current($backup_base_dir, $logger);
+
     eval {
         make_path($config_backup_dir, { mode => 0700 });
         make_path($logs_backup_dir,   { mode => 0700 });
@@ -410,7 +501,8 @@ sub _backup_data {
 
     # Also copy update stage files needed for scheduling/execution
     my $resources_dir = '/Applications/AssetSonarAgent.app/Contents/Resources';
-    my $update_dir    = '/var/db/ocsinventory-agent/update';
+    my $update_base_dir = '/var/db/ocsinventory-agent/update';
+    my $update_current_dir = "$update_base_dir/current";
     my @update_files  = (
         'org.ocsng.update.stage1.plist',
         'update-stage1.sh',
@@ -419,17 +511,20 @@ sub _backup_data {
     );
 
     # Ensure destination directory exists
+    # Rotate existing update/current into archives and start fresh
+    _archive_and_reset_current($update_base_dir, $logger);
+
     eval {
-        make_path($update_dir, { mode => 0700 });
+        make_path($update_current_dir, { mode => 0700 });
     };
     if ($@) {
-        $logger->error("Failed to create update directory $update_dir: $@");
+        $logger->error("Failed to create update directory $update_current_dir: $@");
         return 0;
     }
 
     foreach my $fname (@update_files) {
         my $src = "$resources_dir/$fname";
-        my $dst = "$update_dir/$fname";
+        my $dst = "$update_current_dir/$fname";
         unless (-f $src) {
             $logger->error("Required update file not found: $src");
             return 0;
@@ -467,7 +562,7 @@ sub _download_installer {
     my $full_url = "https://item-agents.s3.us-east-1.amazonaws.com/" . $url_suffix;
     
     # Choose installer extension based on OS
-    my $installer_dir = '/var/db/ocsinventory-agent/update';
+    my $installer_dir = '/var/db/ocsinventory-agent/update/current';
     my $installer_path = "$installer_dir/$url_suffix";
     
     # Create directory if it doesn't exist
@@ -513,7 +608,7 @@ sub _schedule_update {
         return 0;
     }
 
-    my $src_plist = '/var/db/ocsinventory-agent/update/org.ocsng.update.stage1.plist';
+    my $src_plist = '/var/db/ocsinventory-agent/update/current/org.ocsng.update.stage1.plist';
 
     unless (-f $src_plist) {
         $logger->error("Launchd plist not found at $src_plist");
