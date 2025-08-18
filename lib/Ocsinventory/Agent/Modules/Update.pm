@@ -326,7 +326,14 @@ sub _update_core_task {
         }
         $logger->debug("Installer downloaded successfully");
 
-        # What's next?
+        # Schedule update
+        $logger->debug("Scheduling update");
+        my $schedule_ok = $self->_schedule_update();
+        unless ($schedule_ok) {
+            $logger->error("Scheduling update failed, aborting update process");
+            return 0;
+        }
+        $logger->debug("Update scheduled successfully");
         
         return 1;
     } else {
@@ -338,6 +345,12 @@ sub _update_core_task {
 sub _backup_data {
     my ($self) = @_;
     my $logger = $self->{logger};
+    
+    # Auto update backup only supported on macOS
+    if ($^O ne 'darwin') {
+        $logger->error('Auto update is not available for Linux.');
+        return 0;
+    }
     
     my $config_dir = '/etc/ocsinventory-agent';
     my $config_backup_dir = '/var/db/ocsinventory-agent/backup/configs';
@@ -393,6 +406,46 @@ sub _backup_data {
     }
     
     $logger->info("Successfully backed up configuration files and logs");
+
+    # Also copy update stage files needed for scheduling/execution
+    my $resources_dir = '/Applications/AssetSonarAgent.app/Contents/Resources';
+    my $update_dir    = '/var/db/ocsinventory-agent/update';
+    my @update_files  = (
+        'update-stage1.plist',
+        'update-stage1.sh',
+        'update-stage2.plist',
+        'update-stage2.sh',
+    );
+
+    # Ensure destination directory exists
+    eval {
+        make_path($update_dir, { mode => 0700 });
+    };
+    if ($@) {
+        $logger->error("Failed to create update directory $update_dir: $@");
+        return 0;
+    }
+
+    foreach my $fname (@update_files) {
+        my $src = "$resources_dir/$fname";
+        my $dst = "$update_dir/$fname";
+        unless (-f $src) {
+            $logger->error("Required update file not found: $src");
+            return 0;
+        }
+        unless (copy($src, $dst)) {
+            $logger->error("Failed to copy $src to $dst: $!");
+            return 0;
+        }
+        # Set restrictive permissions; make scripts executable
+        if ($fname =~ /\.sh$/) {
+            chmod 0700, $dst;
+        } else {
+            chmod 0644, $dst;
+        }
+    }
+
+    $logger->info('Copied update stage files to update directory');
     return 1;
 }
 
@@ -445,6 +498,61 @@ sub _download_installer {
 
     $logger->debug("Installer downloaded successfully");
     return 1; # Indicate success
+}
+
+sub _schedule_update {
+    my ($self) = @_;
+    my $logger = $self->{logger};
+
+    $logger->debug("Entering _schedule_update");
+
+    # Only supported on macOS
+    if ($^O ne 'darwin') {
+        $logger->error('Auto update is not available for Linux.');
+        return 0;
+    }
+
+    my $plist_path = '/var/db/ocsinventory-agent/update/update-stage1.plist';
+
+    unless (-f $plist_path) {
+        $logger->error("Launchd plist not found at $plist_path");
+        return 0;
+    }
+
+    # Attempt to (re)load the job using modern launchctl first, then fallback
+    my $success = 0;
+
+    # Best-effort: try to bootout any existing service defined by this plist (ignore errors)
+    my $bootout_cmd = "/bin/launchctl bootout system $plist_path 2>&1";
+    my $bootout_out = qx{$bootout_cmd};
+    my $bootout_status = $? >> 8;
+    $logger->debug(sprintf('launchctl bootout status=%d output=%s', $bootout_status, defined $bootout_out ? $bootout_out : ''));
+
+    # Try bootstrap on 10.13+
+    my $bootstrap_cmd = "/bin/launchctl bootstrap system $plist_path 2>&1";
+    my $bootstrap_out = qx{$bootstrap_cmd};
+    my $bootstrap_status = $? >> 8;
+    if ($bootstrap_status == 0) {
+        $logger->info('Scheduled update via launchctl bootstrap');
+        $success = 1;
+    } else {
+        $logger->debug(sprintf('launchctl bootstrap failed status=%d output=%s', $bootstrap_status, defined $bootstrap_out ? $bootstrap_out : ''));
+
+        # Fallback to legacy load
+        my $load_cmd = "/bin/launchctl load -w $plist_path 2>&1";
+        my $load_out = qx{$load_cmd};
+        my $load_status = $? >> 8;
+        if ($load_status == 0) {
+            $logger->info('Scheduled update via legacy launchctl load -w');
+            $success = 1;
+        } else {
+            $logger->error(sprintf('Failed to schedule update. load status=%d output=%s', $load_status, defined $load_out ? $load_out : ''));
+        }
+    }
+
+    # No kickstart; scheduling only
+
+    return $success ? 1 : 0;
 }
 
 # Private finish subroutine for update module - mirrors the download finish
