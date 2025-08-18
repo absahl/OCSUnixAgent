@@ -14,6 +14,7 @@ use version;
 use Fcntl qw/:flock/;
 use File::Path qw(make_path);
 use File::Copy;
+use File::Basename qw(basename);
 use XML::Simple;
 use Digest::MD5;
 
@@ -308,8 +309,8 @@ sub _update_core_task {
             $info->{VERSION}
         ));
 
-        # Backup configuration data and logs
-        $logger->debug("Backing up configuration data and logs");
+        # Backup data
+        $logger->debug("Backing up data");
         my $backup_ok = $self->_backup_data();
         unless ($backup_ok) {
             $logger->error("Backup failed, aborting update process");
@@ -411,9 +412,9 @@ sub _backup_data {
     my $resources_dir = '/Applications/AssetSonarAgent.app/Contents/Resources';
     my $update_dir    = '/var/db/ocsinventory-agent/update';
     my @update_files  = (
-        'update-stage1.plist',
+        'org.ocsng.update.stage1.plist',
         'update-stage1.sh',
-        'update-stage2.plist',
+        'org.ocsng.update.stage2.plist',
         'update-stage2.sh',
     );
 
@@ -512,45 +513,57 @@ sub _schedule_update {
         return 0;
     }
 
-    my $plist_path = '/var/db/ocsinventory-agent/update/update-stage1.plist';
+    my $src_plist = '/var/db/ocsinventory-agent/update/org.ocsng.update.stage1.plist';
 
-    unless (-f $plist_path) {
-        $logger->error("Launchd plist not found at $plist_path");
+    unless (-f $src_plist) {
+        $logger->error("Launchd plist not found at $src_plist");
         return 0;
     }
 
-    # Attempt to (re)load the job using modern launchctl first, then fallback
-    my $success = 0;
+    # Determine destination plist path in standard location (filenames match labels)
+    my $dest_dir = '/Library/LaunchDaemons';
+    my $dest_plist = "$dest_dir/" . basename($src_plist);
 
-    # Best-effort: try to bootout any existing service defined by this plist (ignore errors)
-    my $bootout_cmd = "/bin/launchctl bootout system $plist_path 2>&1";
+    # 1) Unload existing job if exists (best-effort)
+    my $bootout_cmd = "/bin/launchctl bootout system $dest_plist 2>&1";
     my $bootout_out = qx{$bootout_cmd};
     my $bootout_status = $? >> 8;
     $logger->debug(sprintf('launchctl bootout status=%d output=%s', $bootout_status, defined $bootout_out ? $bootout_out : ''));
 
-    # Try bootstrap on 10.13+
-    my $bootstrap_cmd = "/bin/launchctl bootstrap system $plist_path 2>&1";
+    # 2) Copy .plist to standard location with proper perms/ownership
+    unless (copy($src_plist, $dest_plist)) {
+        $logger->error("Failed to copy $src_plist to $dest_plist: $!");
+        return 0;
+    }
+    chmod 0644, $dest_plist;
+    my $uid = (getpwnam('root'))[2];
+    my $gid = (getgrnam('wheel'))[2];
+    if (defined $uid && defined $gid) {
+        chown $uid, $gid, $dest_plist;
+    } else {
+        $logger->debug('Could not resolve root:wheel for chown; skipping ownership change');
+    }
+
+    # 3) Load it (bootstrap preferred, fallback to legacy load)
+    my $success = 0;
+    my $bootstrap_cmd = "/bin/launchctl bootstrap system $dest_plist 2>&1";
     my $bootstrap_out = qx{$bootstrap_cmd};
     my $bootstrap_status = $? >> 8;
     if ($bootstrap_status == 0) {
-        $logger->info('Scheduled update via launchctl bootstrap');
+        $logger->info("Scheduled update via launchctl bootstrap: $dest_plist");
         $success = 1;
     } else {
         $logger->debug(sprintf('launchctl bootstrap failed status=%d output=%s', $bootstrap_status, defined $bootstrap_out ? $bootstrap_out : ''));
-
-        # Fallback to legacy load
-        my $load_cmd = "/bin/launchctl load -w $plist_path 2>&1";
+        my $load_cmd = "/bin/launchctl load -w $dest_plist 2>&1";
         my $load_out = qx{$load_cmd};
         my $load_status = $? >> 8;
         if ($load_status == 0) {
-            $logger->info('Scheduled update via legacy launchctl load -w');
+            $logger->info("Scheduled update via legacy launchctl load -w: $dest_plist");
             $success = 1;
         } else {
             $logger->error(sprintf('Failed to schedule update. load status=%d output=%s', $load_status, defined $load_out ? $load_out : ''));
         }
     }
-
-    # No kickstart; scheduling only
 
     return $success ? 1 : 0;
 }
