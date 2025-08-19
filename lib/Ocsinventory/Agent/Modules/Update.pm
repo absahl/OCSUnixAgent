@@ -23,7 +23,9 @@ sub _format_timestamp_from_mtime {
     my ($path) = @_;
     my @st = stat($path);
     my $mtime = $st[9] || time();
-    return strftime('%Y%m%d_%H%M%S', localtime($mtime));
+    # Use ISO 8601 basic format in UTC to ensure portability in filenames
+    # Example: 20250102T150405Z
+    return strftime('%Y%m%dT%H%M%SZ', gmtime($mtime));
 }
 
 sub _ensure_dir_0700 {
