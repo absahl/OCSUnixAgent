@@ -459,31 +459,22 @@ sub _backup_data {
         return 0;
     }
     
-    # Copy configuration files (flat structure)
-    if (-d $config_dir) {
-        # Read directory contents
-        if (opendir(my $dh, $config_dir)) {
-            while (my $file = readdir($dh)) {
-                next if $file =~ /^\.\.?$/;  # Skip . and ..
-                next if -d "$config_dir/$file"; # Skip any subdirectories
-                
-                my $src_file = "$config_dir/$file";
-                my $dest_file = "$config_backup_dir/$file";
-                
-                unless (copy($src_file, $dest_file)) {
-                    $logger->error("Failed to copy $src_file to $dest_file: $!");
-                    closedir($dh);
-                    return 0;
-                }
+    # Copy selected configuration files into configs
+    my @config_sources = (
+        '/etc/ocsinventory-agent/modules.conf',
+        '/etc/ocsinventory-agent/ocsinventory-agent.cfg',
+        '/Library/LaunchDaemons/org.ocsng.agent.plist',
+    );
+    foreach my $src_file (@config_sources) {
+        my $dest_file = "$config_backup_dir/" . basename($src_file);
+        if (-f $src_file) {
+            unless (copy($src_file, $dest_file)) {
+                $logger->error("Failed to copy $src_file to $dest_file: $!");
+                return 0;
             }
-            closedir($dh);
         } else {
-            $logger->error("Cannot open directory $config_dir: $!");
-            return 0;
+            $logger->info("Config file $src_file does not exist, skipping");
         }
-    } else {
-        $logger->error("Configuration directory $config_dir does not exist");
-        return 0;
     }
     
     # Copy log file if it exists
