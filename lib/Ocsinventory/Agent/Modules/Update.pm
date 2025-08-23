@@ -38,15 +38,31 @@ sub _ensure_dir_0700 {
     return 1;
 }
 
-sub _zip_with_ditto {
+sub _create_archive {
     my ($source_dir, $dest_zip, $logger) = @_;
-    # On macOS, prefer ditto to preserve metadata
-    my $status = system('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', $source_dir, $dest_zip);
-    if ($status != 0) {
-        my $code = $status >> 8;
-        $logger->error("Archiving with ditto failed (exit $code) for $source_dir -> $dest_zip");
+    
+    my $status;
+    if ($^O eq 'darwin') {
+        # On macOS, prefer ditto to preserve metadata
+        $status = system('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', $source_dir, $dest_zip);
+        if ($status != 0) {
+            my $code = $status >> 8;
+            $logger->error("Archiving with ditto failed (exit $code) for $source_dir -> $dest_zip");
+            return 0;
+        }
+    } elsif ($^O eq 'linux') {
+        # On Linux, use zip command
+        $status = system('zip', '-r', $dest_zip, $source_dir);
+        if ($status != 0) {
+            my $code = $status >> 8;
+            $logger->error("Archiving with zip failed (exit $code) for $source_dir -> $dest_zip");
+            return 0;
+        }
+    } else {
+        $logger->error("Unsupported operating system for archiving: $^O");
         return 0;
     }
+    
     return 1;
 }
 
@@ -84,7 +100,7 @@ sub _archive_and_reset_current {
         # Avoid filename collision by appending a counter
         my $suffix = 0;
         while (-e $dest_zip) { $suffix++; $dest_zip = "$archives_dir/${ts}_$suffix.zip"; }
-        my $ok = _zip_with_ditto($current_dir, $dest_zip, $logger);
+        my $ok = _create_archive($current_dir, $dest_zip, $logger);
         if ($ok) {
             $logger->info("Archived $current_dir to $dest_zip");
             _prune_archives_keep_last_n($archives_dir, 5, $logger);
@@ -435,17 +451,21 @@ sub _backup_data {
     my ($self) = @_;
     my $logger = $self->{logger};
     
-    # Auto update backup only supported on macOS
-    if ($^O ne 'darwin') {
-        $logger->error('Auto update is not available for Linux.');
-        return 0;
+    my $config_dir = '/etc/ocsinventory-agent';
+    my $backup_base_dir;
+    my $log_file;
+    
+    # Set platform-specific paths
+    if ($^O eq 'darwin') {
+        $backup_base_dir = '/var/db/ocsinventory-agent/backup';
+        $log_file = '/var/log/ocsng.log';
+    } elsif ($^O eq 'linux') {
+        $backup_base_dir = '/var/lib/ocsinventory-agent/backup';
+        $log_file = '/var/log/ocs_agent.log';
     }
     
-    my $config_dir = '/etc/ocsinventory-agent';
-    my $backup_base_dir = '/var/db/ocsinventory-agent/backup';
     my $backup_current_dir = "$backup_base_dir/current";
     my $config_backup_dir = "$backup_current_dir/configs";
-    my $log_file = '/var/log/ocsng.log';
     my $logs_backup_dir = "$backup_current_dir/logs";
     
     # Create backup directories if they don't exist
@@ -462,11 +482,18 @@ sub _backup_data {
     }
     
     # Copy selected configuration files into configs
-    my @config_sources = (
-        '/etc/ocsinventory-agent/modules.conf',
-        '/etc/ocsinventory-agent/ocsinventory-agent.cfg',
-        '/Library/LaunchDaemons/org.ocsng.agent.plist',
-    );
+    my @config_sources;
+    if ($^O eq 'darwin') {
+        @config_sources = (
+            '/etc/ocsinventory-agent/modules.conf',
+            '/etc/ocsinventory-agent/ocsinventory-agent.cfg',
+            '/Library/LaunchDaemons/org.ocsng.agent.plist',
+        );
+    } elsif ($^O eq 'linux') {
+        @config_sources = (
+            '/opt/ocsinventory/scripts/execute_agent.sh',
+        );
+    }
     foreach my $src_file (@config_sources) {
         my $dest_file = "$config_backup_dir/" . basename($src_file);
         if (-f $src_file) {
@@ -481,7 +508,7 @@ sub _backup_data {
     
     # Copy log file if it exists
     if (-f $log_file) {
-        my $log_dest = "$logs_backup_dir/ocsng.log";
+        my $log_dest = "$logs_backup_dir/" . basename($log_file);
         unless (copy($log_file, $log_dest)) {
             $logger->error("Failed to copy log file $log_file to $log_dest: $!");
             return 0;
@@ -493,15 +520,34 @@ sub _backup_data {
     $logger->info("Successfully backed up configuration files and logs");
 
     # Also copy update stage files needed for scheduling/execution
-    my $resources_dir = '/Applications/AssetSonarAgent.app/Contents/Resources';
-    my $update_base_dir = '/var/db/ocsinventory-agent/update';
-    my $update_current_dir = "$update_base_dir/current";
-    my @update_files  = (
-        'org.ocsng.update.stage1.plist',
-        'update-stage1.sh',
-        'org.ocsng.update.stage2.plist',
-        'update-stage2.sh',
-    );
+    my $resources_dir;
+    my $update_base_dir;
+    my $update_current_dir;
+    my @update_files;
+    
+    if ($^O eq 'darwin') {
+        $resources_dir = '/Applications/AssetSonarAgent.app/Contents/Resources';
+        $update_base_dir = '/var/db/ocsinventory-agent/update';
+        $update_current_dir = "$update_base_dir/current";
+        @update_files = (
+            'org.ocsng.update.stage1.plist',
+            'update-stage1.sh',
+            'org.ocsng.update.stage2.plist',
+            'update-stage2.sh',
+        );
+    } elsif ($^O eq 'linux') {
+        $resources_dir = '/opt/ocsinventory/update';
+        $update_base_dir = '/var/lib/ocsinventory-agent/update';
+        $update_current_dir = "$update_base_dir/current";
+        @update_files = (
+            'ocsng-update-stage1.timer',
+            'ocsng-update-stage1.service',
+            'update-stage1.sh',
+            'ocsng-update-stage2.timer',
+            'ocsng-update-stage2.service',
+            'update-stage2.sh',
+        );
+    }
 
     # Ensure destination directory exists
     # Rotate existing update/current into archives and start fresh
@@ -555,8 +601,15 @@ sub _download_installer {
     my $full_url = "https://item-agents.s3.us-east-1.amazonaws.com/" . $url_suffix;
     
     # Choose installer extension based on OS
-    my $installer_dir = '/var/db/ocsinventory-agent/update/current';
-    my $installer_path = "$installer_dir/$url_suffix";
+    my $installer_dir;
+    if ($^O eq 'darwin') {
+        $installer_dir = '/var/db/ocsinventory-agent/update/current';
+    } elsif ($^O eq 'linux') {
+        $installer_dir = '/var/lib/ocsinventory-agent/update/current';
+    }
+
+    # to take care of the case where the url_suffix is a path like ubuntu/assetsonar-agent.zip
+    my $installer_path = "$installer_dir/" . basename($url_suffix);
     
     # Create directory if it doesn't exist
     eval {
@@ -595,65 +648,117 @@ sub _schedule_update {
 
     $logger->debug("Entering _schedule_update");
 
-    # Only supported on macOS
-    if ($^O ne 'darwin') {
-        $logger->error('Auto update is not available for Linux.');
-        return 0;
-    }
+    # Only supported on macOS and Linux
+    if ($^O eq 'darwin') {
+        # macOS launchd support
+        my $src_plist = '/var/db/ocsinventory-agent/update/current/org.ocsng.update.stage1.plist';
 
-    my $src_plist = '/var/db/ocsinventory-agent/update/current/org.ocsng.update.stage1.plist';
+        unless (-f $src_plist) {
+            $logger->error("Launchd plist not found at $src_plist");
+            return 0;
+        }
 
-    unless (-f $src_plist) {
-        $logger->error("Launchd plist not found at $src_plist");
-        return 0;
-    }
+        # Determine destination plist path in standard location (filenames match labels)
+        my $dest_dir = '/Library/LaunchDaemons';
+        my $dest_plist = "$dest_dir/" . basename($src_plist);
 
-    # Determine destination plist path in standard location (filenames match labels)
-    my $dest_dir = '/Library/LaunchDaemons';
-    my $dest_plist = "$dest_dir/" . basename($src_plist);
+        # 1) Unload existing job if exists (best-effort)
+        my $bootout_cmd = "/bin/launchctl bootout system $dest_plist 2>&1";
+        my $bootout_out = qx{$bootout_cmd};
+        my $bootout_status = $? >> 8;
+        $logger->debug(sprintf('launchctl bootout status=%d output=%s', $bootout_status, defined $bootout_out ? $bootout_out : ''));
 
-    # 1) Unload existing job if exists (best-effort)
-    my $bootout_cmd = "/bin/launchctl bootout system $dest_plist 2>&1";
-    my $bootout_out = qx{$bootout_cmd};
-    my $bootout_status = $? >> 8;
-    $logger->debug(sprintf('launchctl bootout status=%d output=%s', $bootout_status, defined $bootout_out ? $bootout_out : ''));
+        # 2) Copy .plist to standard location with proper perms/ownership
+        unless (copy($src_plist, $dest_plist)) {
+            $logger->error("Failed to copy $src_plist to $dest_plist: $!");
+            return 0;
+        }
+        chmod 0644, $dest_plist;
+        my $uid = (getpwnam('root'))[2];
+        my $gid = (getgrnam('wheel'))[2];
+        if (defined $uid && defined $gid) {
+            chown $uid, $gid, $dest_plist;
+        } else {
+            $logger->debug('Could not resolve root:wheel for chown; skipping ownership change');
+        }
 
-    # 2) Copy .plist to standard location with proper perms/ownership
-    unless (copy($src_plist, $dest_plist)) {
-        $logger->error("Failed to copy $src_plist to $dest_plist: $!");
-        return 0;
-    }
-    chmod 0644, $dest_plist;
-    my $uid = (getpwnam('root'))[2];
-    my $gid = (getgrnam('wheel'))[2];
-    if (defined $uid && defined $gid) {
-        chown $uid, $gid, $dest_plist;
-    } else {
-        $logger->debug('Could not resolve root:wheel for chown; skipping ownership change');
-    }
-
-    # 3) Load it (bootstrap preferred, fallback to legacy load)
-    my $success = 0;
-    my $bootstrap_cmd = "/bin/launchctl bootstrap system $dest_plist 2>&1";
-    my $bootstrap_out = qx{$bootstrap_cmd};
-    my $bootstrap_status = $? >> 8;
-    if ($bootstrap_status == 0) {
-        $logger->info("Scheduled update via launchctl bootstrap: $dest_plist");
-        $success = 1;
-    } else {
-        $logger->debug(sprintf('launchctl bootstrap failed status=%d output=%s', $bootstrap_status, defined $bootstrap_out ? $bootstrap_out : ''));
-        my $load_cmd = "/bin/launchctl load -w $dest_plist 2>&1";
-        my $load_out = qx{$load_cmd};
-        my $load_status = $? >> 8;
-        if ($load_status == 0) {
-            $logger->info("Scheduled update via legacy launchctl load -w: $dest_plist");
+        # 3) Load it (bootstrap preferred, fallback to legacy load)
+        my $success = 0;
+        my $bootstrap_cmd = "/bin/launchctl bootstrap system $dest_plist 2>&1";
+        my $bootstrap_out = qx{$bootstrap_cmd};
+        my $bootstrap_status = $? >> 8;
+        if ($bootstrap_status == 0) {
+            $logger->info("Scheduled update via launchctl bootstrap: $dest_plist");
             $success = 1;
         } else {
-            $logger->error(sprintf('Failed to schedule update. load status=%d output=%s', $load_status, defined $load_out ? $load_out : ''));
+            $logger->debug(sprintf('launchctl bootstrap failed status=%d output=%s', $bootstrap_status, defined $bootstrap_out ? $bootstrap_out : ''));
+            my $load_cmd = "/bin/launchctl load -w $dest_plist 2>&1";
+            my $load_out = qx{$load_cmd};
+            my $load_status = $? >> 8;
+            if ($load_status == 0) {
+                $logger->info("Scheduled update via legacy launchctl load -w: $dest_plist");
+                $success = 1;
+            } else {
+                $logger->error(sprintf('Failed to schedule update. load status=%d output=%s', $load_status, defined $load_out ? $load_out : ''));
+            }
         }
-    }
 
-    return $success ? 1 : 0;
+        return $success ? 1 : 0;
+
+    } elsif ($^O eq 'linux') {
+        # Linux systemd support
+        my $src_service = '/var/lib/ocsinventory-agent/update/current/ocsng-update-stage1.service';
+        my $src_timer = '/var/lib/ocsinventory-agent/update/current/ocsng-update-stage1.timer';
+        my $dest_dir = '/etc/systemd/system';
+        my $dest_service = "$dest_dir/ocsng-update-stage1.service";
+        my $dest_timer = "$dest_dir/ocsng-update-stage1.timer";
+
+        # Check if source files exist
+        unless (-f $src_service) {
+            $logger->error("Service file not found at $src_service");
+            return 0;
+        }
+        unless (-f $src_timer) {
+            $logger->error("Timer file not found at $src_timer");
+            return 0;
+        }
+
+        # 1) Copy service and timer files to systemd directory
+        unless (copy($src_service, $dest_service)) {
+            $logger->error("Failed to copy $src_service to $dest_service: $!");
+            return 0;
+        }
+        unless (copy($src_timer, $dest_timer)) {
+            $logger->error("Failed to copy $src_timer to $dest_timer: $!");
+            return 0;
+        }
+
+        # 2) Set proper permissions
+        chmod 0644, $dest_service;
+        chmod 0644, $dest_timer;
+
+        # 3) Reload systemd daemon
+        my $reload_cmd = "systemctl daemon-reload 2>&1";
+        my $reload_out = qx{$reload_cmd};
+        my $reload_status = $? >> 8;
+        if ($reload_status != 0) {
+            $logger->error("Failed to reload systemd daemon. Status: $reload_status, Output: $reload_out");
+            return 0;
+        }
+        $logger->debug("Systemd daemon reloaded successfully");
+
+        # 4) Start the timer
+        my $start_cmd = "systemctl start ocsng-update-stage1.timer 2>&1";
+        my $start_out = qx{$start_cmd};
+        my $start_status = $? >> 8;
+        if ($start_status != 0) {
+            $logger->error("Failed to start timer. Status: $start_status, Output: $start_out");
+            return 0;
+        }
+        $logger->info("Update timer started successfully: ocsng-update-stage1.timer");
+
+        return 1;
+    }
 }
 
 # Private finish subroutine for update module - mirrors the download finish
