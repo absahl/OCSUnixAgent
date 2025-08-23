@@ -22,12 +22,14 @@ sub new {
     foreach (@{$self->{config}->{etcdir}}) {
         $modulefile = $_.'/modules.conf';
         if (-f $modulefile) {
+            $logger->debug("Running $modulefile");
             if (do $modulefile) {
                 $logger->debug("Turns hooks on for $modulefile");
                 $self->{dontuse} = 0;
                 last;
             } else {
-                $logger->debug("Failed to load `$modulefile': $?");
+                my $verbose_error = $@ || $! || "Unknown error (file returned false value)";
+                $logger->debug("Failed to load `$modulefile' <error:$?> <verbose:$verbose_error>");
             }
         }
     }

@@ -7,6 +7,9 @@ use warnings;
 use IO::Socket::SSL qw(SSL_VERIFY_NONE);
 use LWP::UserAgent;
 use Socket;
+use URI;
+use Mozilla::CA;
+use XML::Simple;
 
 use Ocsinventory::Compress;
 use Ocsinventory::Agent::Encrypt;
@@ -43,6 +46,7 @@ sub new {
 
     $self->{compress} = new Ocsinventory::Compress ({logger => $logger});
     # Connect to server
+    $self->{external_ua} = LWP::UserAgent->new; # for external pacakages e.g. from S3
     $self->{ua} = LWP::UserAgent->new(keep_alive => 1);
     if ($self->{config}->{proxy}) {
         $self->{ua}->proxy(['http', 'https'], 'connect://'.$self->{config}->{proxy}.'');
@@ -189,6 +193,41 @@ sub getFile {
         $logger->error("Failed downloading $filetoget: ".$response->status_line." !!!");
         return 1;
     }
+}
+
+sub getFileFromUrl {
+    my ($self, $url, $filepath) = @_;
+    my $logger= $self->{logger};
+
+    chomp($url, $filepath);
+
+    my $response;
+    my $userver = URI->new($self->{URI});
+    my $uurl = URI->new($url);
+    if ($userver->host eq $uurl->host) {
+        $logger->debug("Downloading file <url:$url> <external:0> <filepath:$filepath>");
+        $response = $self->{ua}->mirror($url, $filepath);
+    } else {
+        $logger->debug("Downloading file <url:$url> <external:1> <filepath:$filepath>");
+        $response = $self->{external_ua}->get($url, ':content_file' => $filepath);
+    }
+
+    unless ($response->is_success) {
+        my $status_line = $response->status_line;
+        $logger->error("Failed downloading file <status:$status_line>");
+
+        # reading server response
+        my $decoded_content = $response->decoded_content;
+        $logger->debug("Failure decoded content: $decoded_content");
+
+        # parsing server response
+        my $xml = XMLin($decoded_content);
+        my $message = $xml->{Message};
+        return $message;
+    }
+
+    $logger->debug("Success downloading file");
+    return undef;
 }
 
 1;
